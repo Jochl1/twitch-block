@@ -211,26 +211,34 @@ function noAdsFilter() {
     return u.origin + u.pathname;
   }
 
+  /** Seconds a segment from another source may start before the last one placed ends (clocks differ a little). */
+  const OVERLAP = 0.5;
+
   /**
    * Cuts segments out of one live stream's media playlists without breaking them for the player: kept segments get
    * numbers of their own, contiguous and the same on every reload and in every variant; a cut is marked with a
    * discontinuity, counted once it leaves the window. No clock.
+   *
+   * Segments may come from more than one source (`segment.source`, default 'main': the stream's own variants, which
+   * share their numbers; else a backup copy). A segment from another source than the last one placed is placed only
+   * when it starts where that one ended or later (by program date), and starts a new run: earlier segments are left
+   * out of the answers from then on, since what lay between them isn't in the playlist any more.
    */
   function createSplicer() {
-    // Source number → { out: own number, cut: a cut came before it }. Inserted in rising order.
+    // Source and number ("main:7438") → { out: own number, cut: a cut came before it }. Inserted in rising order.
     const numbers = new Map();
     const served = new Map();
-    let newestSource = null;
+    let last = null; // the newest placed: { source, sequence, end }
     let newestOut = 0;
+    let floor = -Infinity; // the own number the current run starts at
     let forgottenCuts = 0;
 
-    function forget(playlist) {
-      if (playlist.segments.length === 0) return;
-      const below = playlist.segments[0].sequence - KEEP;
-      for (const [source, v] of numbers) {
-        if (source >= below) break;
+    function forget() {
+      const below = newestOut - KEEP;
+      for (const [id, v] of numbers) {
+        if (v.out >= below) break;
         if (v.cut) forgottenCuts++;
-        numbers.delete(source);
+        numbers.delete(id);
       }
     }
 
@@ -240,33 +248,51 @@ function noAdsFilter() {
      */
     function splice(playlist, url, drop, options = {}) {
       const key = pathKey(url);
-      const kept = [];
+      let kept = [];
       let dropped = 0;
       for (const segment of playlist.segments) {
         if (drop(segment)) {
           dropped++;
           continue;
         }
-        const known = numbers.get(segment.sequence);
+        const source = segment.source || 'main';
+        const id = source + ':' + segment.sequence;
+        const known = numbers.get(id);
         if (known) {
           kept.push({ segment, out: known.out, cut: known.cut });
           continue;
         }
-        // Older than what was numbered already (a variant whose window starts earlier): it can't be placed.
-        if (newestSource != null && segment.sequence < newestSource) {
-          dropped++;
-          continue;
+        if (last != null) {
+          // Older than what was numbered already (a variant whose window starts earlier): it can't be placed.
+          if (source === last.source && segment.sequence < last.sequence) {
+            dropped++;
+            continue;
+          }
+          // Another source's segment for a moment already shown.
+          if (source !== last.source && segment.date != null && last.end != null && segment.date < last.end - OVERLAP * 1000) {
+            dropped++;
+            continue;
+          }
         }
-        const out = newestSource == null ? segment.sequence : newestOut + 1;
-        const cut = newestSource != null && segment.sequence !== newestSource + 1;
-        numbers.set(segment.sequence, { out, cut });
-        newestSource = segment.sequence;
+        const out = last == null ? segment.sequence : newestOut + 1;
+        const cut = last != null && (source !== last.source || segment.sequence !== last.sequence + 1);
+        if (last != null && source !== last.source) floor = out;
+        numbers.set(id, { out, cut });
+        last = { source, sequence: segment.sequence, end: segment.date == null ? null : segment.date + segment.duration * 1000 };
         newestOut = out;
         kept.push({ segment, out, cut });
       }
-      forget(playlist);
+      forget();
+      // Only the current run, in order, and only its newest stretch without a gap.
+      kept = kept.filter((k) => k.out >= floor).sort((a, b) => a.out - b.out);
+      let from = kept.length - 1;
+      while (from > 0 && kept[from - 1].out === kept[from].out - 1) from--;
+      if (from > 0) {
+        dropped += from;
+        kept = kept.slice(from);
+      }
 
-      const first = kept.length > 0 ? kept[0].out : newestSource == null ? playlist.mediaSequence : newestOut + 1;
+      const first = kept.length > 0 ? kept[0].out : last == null ? playlist.mediaSequence : newestOut + 1;
       let cutsBefore = forgottenCuts;
       for (const v of numbers.values()) if (v.cut && v.out < first) cutsBefore++;
       const newest = kept.length > 0 ? kept[kept.length - 1].out : null;
@@ -296,17 +322,20 @@ function noAdsFilter() {
     let map = null;
     let key = null;
     for (const { segment, cut } of kept) {
+      const base = segment.base || url;
       if (cut) out.push('#EXT-X-DISCONTINUITY');
-      if (segment.map != null && segment.map !== map) {
-        out.push(rewriteUri(segment.map, url));
-        map = segment.map;
+      if (segment.map != null) {
+        const line = rewriteUri(segment.map, base);
+        if (line !== map) out.push(line);
+        map = line;
       }
-      if (segment.key != null && segment.key !== key) {
-        out.push(rewriteUri(segment.key, url));
-        key = segment.key;
+      if (segment.key != null) {
+        const line = rewriteUri(segment.key, base);
+        if (line !== key) out.push(line);
+        key = line;
       }
       for (const tag of segment.tags) out.push(tag);
-      out.push(absolute(segment.uri, url));
+      out.push(absolute(segment.uri, base));
     }
     for (const line of playlist.trailer) {
       if (options.keepTrailer && !options.keepTrailer(line)) continue;
@@ -321,15 +350,20 @@ function noAdsFilter() {
    * each media playlist comes out without its ads. Tracks breaks like Lumen's TwitchAdFilter. Never throws: on any
    * error the text as fetched.
    *
-   * playlist(text, url) → { text, kind: 'master' | 'media' | 'other' | 'error', inBreak, events, logs }
-   *   events: worker → page messages ({ type: 'noads:break', on, seconds }); logs: lines for the console.
+   * info(text, url) → { login, height, bandwidth, wantsBackup }: whether this media playlist is in a break (stage 2:
+   *   the worker then fetches a backup copy's media playlist and gives it to playlist()), without changing anything.
+   * playlist(text, url, backup?) → { text, kind: 'master' | 'media' | 'other' | 'error', inBreak, backupHadAds,
+   *   events, logs }. backup: { text, url } of the backup copy's media playlist, used while the break lasts unless it
+   *   has ads itself (backupHadAds: try another). events: worker → page messages ({ type: 'noads:break', on,
+   *   seconds, backup }); logs: lines for the console.
    */
   function createSession() {
     const streams = new Map(); // a variant's path key → its stream
+    const variants = new Map(); // a variant's path key → { height, bandwidth }
     const seen = new Set();
 
-    function newStream() {
-      return { splicer: createSplicer(), seenAds: new Set(), breakSegments: 0, breakSeconds: 0, breakTold: null, inBreak: false, vodTold: false };
+    function newStream(login) {
+      return { login, splicer: createSplicer(), seenAds: new Set(), breakSegments: 0, breakSeconds: 0, breakTold: null, inBreak: false, shown: null, vodTold: false };
     }
 
     function remember(key, stream) {
@@ -338,32 +372,67 @@ function noAdsFilter() {
       const owners = new Set(streams.values());
       if (owners.size <= MAX_STREAMS) return;
       const oldest = streams.values().next().value;
-      for (const [k, s] of streams) if (s === oldest) streams.delete(k);
+      for (const [k, s] of streams) {
+        if (s !== oldest) continue;
+        streams.delete(k);
+        variants.delete(k);
+      }
     }
 
     function master(text, url) {
-      const stream = newStream();
-      for (const line of lines(text)) {
-        const l = line.trim();
-        if (!l) continue;
-        if (l[0] !== '#') remember(pathKey(absolute(l, url)), stream);
-        else if (l.startsWith('#EXT-X-MEDIA:')) {
-          const m = /URI="([^"]*)"/.exec(l);
-          if (m) remember(pathKey(absolute(m[1], url)), stream);
-        }
+      const stream = newStream(channelOf(url));
+      for (const v of parseMaster(text, url)) {
+        remember(v.key, stream);
+        variants.set(v.key, { height: v.height, bandwidth: v.bandwidth });
       }
     }
 
-    function media(text, url, logs, events) {
+    function streamFor(url) {
       const key = pathKey(url);
       let stream = streams.get(key);
       if (!stream) {
-        stream = newStream();
+        stream = newStream(null);
         remember(key, stream);
       }
+      return stream;
+    }
+
+    function info(text, url) {
+      try {
+        const key = pathKey(url);
+        const stream = streams.get(key);
+        const variant = variants.get(key) || {};
+        if (!stream || !stream.login || typeof text !== 'string' || isMaster(text)) return { login: null, wantsBackup: false };
+        const s = scan(text);
+        return { login: stream.login, height: variant.height ?? null, bandwidth: variant.bandwidth ?? null, wantsBackup: !s.playlist.ended && (s.inBreak || stream.inBreak) };
+      } catch (e) {
+        return { login: null, wantsBackup: false };
+      }
+    }
+
+    function media(text, url, backup, logs, events) {
+      const stream = streamFor(url);
       const s = scan(text);
+      // Stage 2: the backup copy's segments while the break lasts, until the stream's own content takes over again.
+      let b = null;
+      let backupHadAds = false;
+      if (backup && (s.inBreak || stream.inBreak) && !s.playlist.ended) {
+        const bs = scan(backup.text);
+        if (bs.inBreak) backupHadAds = true;
+        else b = bs;
+      }
+      let playlist = s.playlist;
+      let drop = s.isAd;
+      if (b) {
+        const source = 'backup:' + pathKey(backup.url);
+        const backupSegments = b.playlist.segments.map((seg) => Object.assign({}, seg, { source, base: backup.url, ad: b.isAd(seg) }));
+        const own = s.playlist.segments.map((seg) => Object.assign({}, seg, { ad: s.isAd(seg) }));
+        // The backup's first: the stream's own content after the break is placed only from where the backup got to.
+        playlist = Object.assign({}, s.playlist, { segments: backupSegments.concat(own) });
+        drop = (seg) => seg.ad;
+      }
       const dropPrefetch = s.inBreak || s.breakAhead;
-      const cut = stream.splicer.splice(s.playlist, url, s.isAd, {
+      const cut = stream.splicer.splice(playlist, url, drop, {
         dropRange: isAdRange,
         keepTrailer: (line) => !(dropPrefetch && isPrefetch(line)),
       });
@@ -374,14 +443,17 @@ function noAdsFilter() {
           stream.vodTold = true;
           logs.push(`vod: ${s.ads.size} ad segments dropped`);
         }
-        return { text: cut.text, inBreak: false };
+        return { text: cut.text, inBreak: false, backupHadAds };
       }
-      track(stream, s, cut, logs, events);
-      return { text: cut.text, inBreak: s.inBreak || (stream.inBreak && cut.kept === 0) };
+      track(stream, s, cut, b != null, logs, events);
+      return { text: cut.text, inBreak: s.inBreak || (stream.inBreak && cut.kept === 0), backupHadAds };
     }
 
-    /** Counts the break's dropped segments; tells when one starts and when content comes back after it. */
-    function track(stream, s, cut, logs, events) {
+    /**
+     * Counts the break's dropped segments; tells when one starts, when it switches between the backup copy and the
+     * card, and when content comes back after it.
+     */
+    function track(stream, s, cut, backupUsed, logs, events) {
       for (const seg of s.playlist.segments) {
         if (!s.isAd(seg) || stream.seenAds.has(seg.sequence)) continue;
         stream.seenAds.add(seg.sequence);
@@ -392,52 +464,158 @@ function noAdsFilter() {
         for (const n of stream.seenAds) if (n < s.playlist.mediaSequence) stream.seenAds.delete(n);
       }
       if (s.breakSeconds != null) stream.breakTold = s.breakSeconds;
-      if (s.inBreak && !stream.inBreak) {
-        stream.inBreak = true;
-        logs.push('ad break');
-        events.push({ type: 'noads:break', on: true, seconds: s.breakSeconds });
-      } else if (!s.inBreak && (stream.inBreak || stream.breakSegments > 0) && cut.fresh) {
+      if (s.inBreak) {
+        if (!stream.inBreak) {
+          stream.inBreak = true;
+          logs.push('ad break');
+        }
+        const shown = backupUsed ? 'backup' : 'card';
+        if (shown !== stream.shown) {
+          stream.shown = shown;
+          events.push({ type: 'noads:break', on: true, seconds: s.breakSeconds, backup: backupUsed });
+        }
+      } else if ((stream.inBreak || stream.breakSegments > 0) && cut.fresh) {
         // Also a short break that came and went between two reloads.
-        const wasOn = stream.inBreak;
         stream.inBreak = false;
         const seconds = stream.breakTold ?? stream.breakSeconds;
         logs.push(`ad break ${Math.ceil(seconds)} s, ${stream.breakSegments} segments dropped`);
-        if (wasOn) events.push({ type: 'noads:break', on: false, seconds: null });
+        if (stream.shown) events.push({ type: 'noads:break', on: false, seconds: null, backup: false });
+        stream.shown = null;
         stream.breakSegments = 0;
         stream.breakSeconds = 0;
         stream.breakTold = null;
       }
     }
 
-    function playlist(text, url) {
+    function playlist(text, url, backup) {
       const logs = [];
       const events = [];
       try {
-        if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return { text, kind: 'other', inBreak: false, events, logs };
+        if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return { text, kind: 'other', inBreak: false, backupHadAds: false, events, logs };
         const kind = isMaster(text) ? 'master' : 'media';
         const key = pathKey(url);
         if (!seen.has(key)) {
           seen.add(key);
           if (seen.size > 200) seen.delete(seen.values().next().value);
-          logs.push(`${kind} ${url}`);
+          logs.push(`${kind} ${url.split('?')[0]}`);
         }
         if (kind === 'master') {
           master(text, url);
-          return { text, kind, inBreak: false, events, logs };
+          return { text, kind, inBreak: false, backupHadAds: false, events, logs };
         }
-        const done = media(text, url, logs, events);
-        return { text: done.text, kind, inBreak: done.inBreak, events, logs };
+        const done = media(text, url, backup, logs, events);
+        return { text: done.text, kind, inBreak: done.inBreak, backupHadAds: done.backupHadAds, events, logs };
       } catch (e) {
         // Never break playback over the filter: the playlist as fetched.
         logs.push(`playlist filter failed (${(e && e.name) || 'error'}): unfiltered`);
-        return { text, kind: 'error', inBreak: false, events, logs };
+        return { text, kind: 'error', inBreak: false, backupHadAds: false, events, logs };
       }
     }
 
-    return { playlist };
+    return { info, playlist };
   }
 
-  return { parseMedia, parseAttributes, parseDate, dateRange, rangeContains, isAdRange, isMaster, scan, createSplicer, createSession };
+  // Stage 2 (docs/START.md §3): what the worker asks Twitch for a backup copy. The worker does the fetching.
+
+  /** Twitch's public web client id (streamlink, Pi-Cast and Lumen use it). */
+  const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
+  /** PlaybackAccessToken's persisted-query hash, from Lumen (2026-10-31); on PersistedQueryNotFound see streamlink. */
+  const TOKEN_HASH = 'ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9';
+  /** Player types asked for a backup copy, in order; which come back without ads changes over time. */
+  const PLAYER_TYPES = ['embed', 'popout', 'autoplay', 'picture-by-picture'];
+
+  /** The channel a live master playlist is for (usher's /channel/hls/<login>.m3u8), or null. */
+  function channelOf(url) {
+    const m = /\/channel\/hls\/([^/]+)\.m3u8$/i.exec(new URL(url).pathname);
+    return m ? decodeURIComponent(m[1]).toLowerCase() : null;
+  }
+
+  /** A master playlist's variants and renditions: { url, key, height, bandwidth, audioOnly }. */
+  function parseMaster(text, url) {
+    const result = [];
+    let inf = null;
+    for (const raw of lines(text)) {
+      const l = raw.trim();
+      if (!l) continue;
+      if (l.startsWith('#EXT-X-STREAM-INF:')) inf = parseAttributes(l.slice(l.indexOf(':') + 1));
+      else if (l.startsWith('#EXT-X-MEDIA:')) {
+        const m = /URI="([^"]*)"/.exec(l);
+        if (m) result.push({ url: absolute(m[1], url), key: pathKey(absolute(m[1], url)), height: null, bandwidth: null, audioOnly: false });
+      } else if (l[0] !== '#') {
+        const a = inf || {};
+        const res = /^(\d+)x(\d+)$/.exec(a.RESOLUTION || '');
+        const href = absolute(l, url);
+        result.push({
+          url: href,
+          key: pathKey(href),
+          height: res ? Number(res[2]) : null,
+          bandwidth: parseNumber(a.BANDWIDTH),
+          audioOnly: !res && /audio/i.test((a['IVS-NAME'] || '') + (a['STABLE-VARIANT-ID'] || '') + (a.VIDEO || '')),
+        });
+        inf = null;
+      }
+    }
+    return result;
+  }
+
+  /** The variant of a master playlist closest to `want` ({ height, bandwidth }; the best when unknown), or null. */
+  function pickVariant(text, url, want = {}) {
+    const all = parseMaster(text, url).filter((v) => v.bandwidth != null && !v.audioOnly);
+    if (all.length === 0) return null;
+    const score = (v) => [
+      want.height != null && v.height != null ? Math.abs(v.height - want.height) : want.height != null ? Infinity : -(v.height ?? 0),
+      want.bandwidth != null ? Math.abs(v.bandwidth - want.bandwidth) : -v.bandwidth,
+    ];
+    all.sort((a, b) => {
+      const x = score(a);
+      const y = score(b);
+      return x[0] - y[0] || x[1] - y[1];
+    });
+    return all[0].url;
+  }
+
+  /** The signed-out PlaybackAccessToken request for a live channel with one player type. */
+  function tokenRequest(login, playerType) {
+    return {
+      url: 'https://gql.twitch.tv/gql',
+      method: 'POST',
+      headers: { 'Client-ID': CLIENT_ID, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        operationName: 'PlaybackAccessToken',
+        extensions: { persistedQuery: { version: 1, sha256Hash: TOKEN_HASH } },
+        variables: { isLive: true, login, isVod: false, vodID: '', playerType, platform: 'site' },
+      }),
+    };
+  }
+
+  /** { signature, value } from a PlaybackAccessToken answer, or null. */
+  function readToken(json) {
+    const data = json && (Array.isArray(json) ? json[0] : json).data;
+    const t = data && (data.streamPlaybackAccessToken || data.videoPlaybackAccessToken);
+    return t && t.signature && t.value ? { signature: t.signature, value: t.value } : null;
+  }
+
+  /** usher's master playlist for a live channel with a token (Lumen's TwitchResolver.UsherUrl); p: 0–999999. */
+  function usherUrl(login, token, p) {
+    const q = new URLSearchParams({
+      platform: 'web',
+      p: String(p),
+      allow_source: 'true',
+      allow_audio_only: 'true',
+      playlist_include_framerate: 'true',
+      multigroup_video: 'true',
+      supported_codecs: 'h264',
+      fast_bread: 'true',
+      sig: token.signature,
+      token: token.value,
+    });
+    return `https://usher.ttvnw.net/api/v2/channel/hls/${encodeURIComponent(login)}.m3u8?${q}`;
+  }
+
+  return {
+    parseMedia, parseAttributes, parseDate, dateRange, rangeContains, isAdRange, isMaster, scan, createSplicer, createSession,
+    PLAYER_TYPES, channelOf, parseMaster, pickVariant, tokenRequest, readToken, usherUrl,
+  };
 }
 
 if (typeof module === 'object' && module && module.exports) module.exports = noAdsFilter;

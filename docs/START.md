@@ -180,6 +180,22 @@ loophole, so it must always fall back to stage 1. In the worker, when a break st
 
 3. A backup that has ads too: try the next `playerType`; none clean: stage 1 (pause, overlay).
 
+How it is built (2026-10-31):
+
+- `filter.js` stays pure: it builds the requests (`tokenRequest`, `readToken`, `usherUrl`, `pickVariant`) and does
+  the splicing; `hook.js`'s worker code does the fetching (4 s timeout per request, so a hanging backup can't stall
+  the player for long). The channel comes from the master playlist's URL (`/channel/hls/<login>.m3u8`); the variant
+  wanted is the one being played (its height, then bandwidth, from that master).
+- Per reload during a break the worker fetches the backup's media playlist and hands it to `session.playlist`. The
+  splicer gives each source (`main`, `backup:<path>`) its own segment ids. A segment from another source than the last
+  one placed is placed only when its program date is at or after where that one ended (0.5 s slack), and starts a new
+  run: answers leave out the earlier run from then on. The backup's segments are placed before the stream's own, and
+  the backup is kept until the stream's own content reaches past it, so it switches once each way.
+- One token per player type per break; a backup with ads, a failing request or a failing playlist moves on to the next
+  type. The worker forgets the backup when the break is over.
+- With a backup playing, the overlay is only a small label ("Ad break skipped: backup stream"), not the card.
+- VODs: not done (their ads are removed whole by stage 1, so there's no break to fill).
+
 The token request goes signed out (no `Authorization`), as Lumen and Pi-Cast do.
 
 ## 4. Opera GX
@@ -202,10 +218,11 @@ The token request goes signed out (no `Authorization`), as Lumen and Pi-Cast do.
 | 4 | VODs and embeds (`player.twitch.tv`) | A VOD with a mid-roll plays without it; an embed on another site is filtered |
 | 5 | Stage 2, if wanted | A break shows the backup stream instead of the card, or falls back cleanly |
 
-Status (2026-10-31): steps 1–3 are written and the node tests pass (`test/filter.test.js`, and `test/worker.test.js`,
-which runs the worker code built as in the browser against a fake `fetch`). Steps 2–3 are not yet checked in Opera GX.
-The filter is always on; step 2's URL log is there too (`noads: worker …`, `noads: master …`, `noads: media …`, each
-first sighting once).
+Status (2026-10-31): steps 1–3 and 5 are written and the node tests pass (`test/filter.test.js`; `test/worker.test.js`
+and `test/backup.test.js` run the worker code built as in the browser against a fake `fetch`). In Opera GX: the hook
+works (step 2) and a break is cut out with the card showing (step 3). Stage 2 is not yet checked in the browser. The
+URL log is on (`noads: worker …`, `noads: master …`, `noads: media …`, each first sighting once, without the query,
+which holds the token and the viewer's IP).
 
 Catching a break to test: big channels run them every 15–30 minutes; a fresh start often has a pre-roll.
 

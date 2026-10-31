@@ -43,7 +43,7 @@ test('worker: media playlists come out filtered, the break is posted; masters an
   assert.equal(media.status, 200);
   assert.equal(media.url, 'https://edge.example/v1/playlist/a.m3u8');
   assert.ok(!text.includes('Amazon') && text.startsWith('#EXTM3U'));
-  assert.deepEqual(posted, [{ type: 'noads:break', on: true, seconds: 30 }]);
+  assert.deepEqual(posted, [{ type: 'noads:break', on: true, seconds: 30, backup: false }]);
 
   assert.equal(await (await scope.fetch('https://edge.example/v1/segment/x.ts')).text(), 'binary');
   assert.equal(await (await scope.fetch('https://edge.example/v1/playlist/garbage.m3u8')).text(), '<html>oops</html>');

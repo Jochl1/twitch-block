@@ -166,7 +166,7 @@ test('session: a break start then its end through one stream: ads gone, numbers 
   assert.ok(first.inBreak);
   assert.ok(!first.text.includes('Amazon') && !first.text.includes('stitched-ad') && !first.text.includes('AD-INIT'), 'ads, their range and init segment gone');
   assert.ok(!first.text.includes('PREFETCH'));
-  assert.deepEqual(first.events, [{ type: 'noads:break', on: true, seconds: 30 }]);
+  assert.deepEqual(first.events, [{ type: 'noads:break', on: true, seconds: 30, backup: false }]);
   assert.ok(first.logs.includes('ad break'));
 
   const again = session.playlist(fixture('media_ad_start.m3u8'), MEDIA_URL);
@@ -182,7 +182,7 @@ test('session: a break start then its end through one stream: ads gone, numbers 
   assert.ok(b.mediaSequence >= a.mediaSequence, 'never back');
   assert.ok(end.text.indexOf('#EXT-X-DISCONTINUITY\n') < end.text.indexOf('/v1/segment/CxQD'), 'before the first content');
   assert.ok(end.text.includes(`#EXT-X-TWITCH-LIVE-SEQUENCE:${b.mediaSequence}\n`));
-  assert.deepEqual(end.events, [{ type: 'noads:break', on: false, seconds: null }]);
+  assert.deepEqual(end.events, [{ type: 'noads:break', on: false, seconds: null, backup: false }]);
   assert.deepEqual(end.logs, ['ad break 30 s, 8 segments dropped']);
 });
 

@@ -18,6 +18,8 @@
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
     }
     .noads-card small { display: block; margin-top: 4px; font-weight: 400; color: #adadb8; }
+    .noads-card.noads-backup { inset: auto; top: 10px; left: 10px; background: none; }
+    .noads-card.noads-backup > div { padding: 6px 10px; font-size: 12px; font-weight: 600; }
   `;
   (document.head || document.documentElement).appendChild(style);
 
@@ -40,22 +42,25 @@
   }
 
   function render() {
-    if (!card) return;
+    if (!card || card.classList.contains('noads-backup')) return;
     const left = endsAt == null ? null : Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
     card.querySelector('small').textContent = left == null ? '' : left > 0 ? `about ${left} s left` : 'any moment now';
   }
 
-  function show(seconds) {
+  /** The card over the picture; with a backup copy playing, only a small label in the corner. */
+  function show(seconds, backup) {
     endsAt = seconds > 0 ? Date.now() + seconds * 1000 : null;
     const video = player();
     const host = video && video.parentElement;
     if (!host) return;
-    if (!card || card.parentElement !== host) {
+    if (!card || card.parentElement !== host || card.classList.contains('noads-backup') !== backup) {
       hide();
       if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
       card = document.createElement('div');
-      card.className = 'noads-card';
-      card.innerHTML = '<div>Ad break: the stream goes on after it<small></small></div>';
+      card.className = backup ? 'noads-card noads-backup' : 'noads-card';
+      card.innerHTML = backup
+        ? '<div>Ad break skipped: backup stream</div>'
+        : '<div>Ad break: the stream goes on after it<small></small></div>';
       host.appendChild(card);
     }
     render();
@@ -71,7 +76,7 @@
 
   window.addEventListener('noads:break', (event) => {
     const detail = event.detail || {};
-    if (detail.on) show(detail.seconds);
+    if (detail.on) show(detail.seconds, !!detail.backup);
     else hide();
   });
 })();
