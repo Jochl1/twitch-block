@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch without ads",
+  "version": "0.1.0",
+  "description": "Cuts Twitch's stitched ads out of the web player's playlists.",
+  "content_scripts": [{
+    "matches": ["https://www.twitch.tv/*", "https://m.twitch.tv/*", "https://player.twitch.tv/*"],
+    "js": ["src/filter.js", "src/hook.js", "src/overlay.js"],
+    "run_at": "document_start",
+    "world": "MAIN",
+    "all_frames": true
+  }]
+}
