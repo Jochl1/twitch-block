@@ -228,6 +228,7 @@ function noAdsFilter() {
     // Source and number ("main:7438") → { out: own number, cut: a cut came before it }. Inserted in rising order.
     const numbers = new Map();
     const served = new Map();
+    const held = new Map(); // address → the last answer with segments in it
     let last = null; // the newest placed: { source, sequence, end }
     let newestOut = 0;
     let floor = -Infinity; // the own number the current run starts at
@@ -297,8 +298,16 @@ function noAdsFilter() {
       for (const v of numbers.values()) if (v.cut && v.out < first) cutsBefore++;
       const newest = kept.length > 0 ? kept[kept.length - 1].out : null;
       const fresh = newest != null && (!served.has(key) || newest > served.get(key));
+      // Nothing to show (a long break without a backup, or the stream's own content not yet past the backup's): the
+      // last answer again. An empty live playlist reads as the stream gone, and Twitch shows its offline screen.
+      if (kept.length === 0 && held.has(key)) return { text: held.get(key), kept: 0, dropped, fresh: false, key, newest: null, held: true };
       const text = write(playlist, url, kept, first, cutsBefore, options);
-      return { text, kept: kept.length, dropped, fresh, key, newest };
+      if (kept.length > 0) {
+        held.delete(key);
+        held.set(key, text);
+        if (held.size > 16) held.delete(held.keys().next().value);
+      }
+      return { text, kept: kept.length, dropped, fresh, key, newest, held: false };
     }
 
     /** The cut was answered: the next answer for that address is fresh only with something newer. */
@@ -363,7 +372,7 @@ function noAdsFilter() {
     const seen = new Set();
 
     function newStream(login) {
-      return { login, splicer: createSplicer(), seenAds: new Set(), breakSegments: 0, breakSeconds: 0, breakTold: null, inBreak: false, shown: null, vodTold: false };
+      return { login, splicer: createSplicer(), seenAds: new Set(), breakSegments: 0, breakSeconds: 0, breakTold: null, inBreak: false, shown: null, vodTold: false, holding: false };
     }
 
     function remember(key, stream) {
@@ -437,6 +446,10 @@ function noAdsFilter() {
         keepTrailer: (line) => !(dropPrefetch && isPrefetch(line)),
       });
       stream.splicer.served(cut);
+      if (cut.held !== stream.holding) {
+        stream.holding = cut.held;
+        if (cut.held) logs.push('nothing new to show: the last playlist again');
+      }
       // An ended playlist (a VOD) is whole: never "in a break", even when it ends on ads.
       if (s.playlist.ended) {
         if (!stream.vodTold && s.ads.size > 0) {
@@ -472,6 +485,7 @@ function noAdsFilter() {
         const shown = backupUsed ? 'backup' : 'card';
         if (shown !== stream.shown) {
           stream.shown = shown;
+          logs.push(backupUsed ? 'showing the backup stream' : 'showing the card (no backup)');
           events.push({ type: 'noads:break', on: true, seconds: s.breakSeconds, backup: backupUsed });
         }
       } else if ((stream.inBreak || stream.breakSegments > 0) && cut.fresh) {

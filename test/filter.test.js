@@ -131,18 +131,34 @@ test("splicer: a variant whose window starts earlier drops what can't be placed;
   assert.ok(other.text.includes('#EXT-X-MEDIA-SEQUENCE:200\n'));
 });
 
-test("splicer: fresh only with a segment that address wasn't answered with; an empty answer keeps counting on", () => {
+test("splicer: fresh only with a segment that address wasn't answered with; nothing to show → the last answer again", () => {
   const splicer = f.createSplicer();
   const first = cut(splicer, 1, 'cc');
   assert.ok(first.fresh);
   splicer.served(first);
   assert.ok(!cut(splicer, 1, 'cc').fresh, 'nothing new');
   assert.ok(!cut(splicer, 1, 'cca').fresh, 'only an ad new');
-  assert.ok(cut(splicer, 1, 'ccac').fresh);
-  const empty = cut(splicer, 10, 'aaa');
-  assert.equal(empty.kept, 0);
-  assert.ok(!empty.fresh);
+  const last = cut(splicer, 1, 'ccac');
+  assert.ok(last.fresh);
+  const held = cut(splicer, 10, 'aaa');
+  assert.equal(held.kept, 0);
+  assert.ok(held.held && !held.fresh);
+  assert.equal(held.text, last.text, 'never an empty live playlist: Twitch reads it as offline');
+  const empty = cut(splicer, 10, 'aaa', 'https://edge.example/v1/playlist/other.m3u8');
+  assert.ok(!empty.held, 'an address never answered has nothing to hold');
   assert.ok(empty.text.includes('#EXT-X-MEDIA-SEQUENCE:4\n'), 'the next own number');
+});
+
+test('session: a long break without a backup holds the last playlist; content goes on after it', () => {
+  const s = f.createSession();
+  const answers = ['cccccc', 'ccccaa', 'ccaaaa', 'aaaaaa', 'aaaaaa', 'aacccc'].map((kinds, i) => s.playlist(playlist(100 + 2 * i, kinds), MEDIA_URL));
+  assert.equal(segments(answers[2].text), 'seg104.mp4,seg105.mp4');
+  assert.equal(answers[3].text, answers[2].text);
+  assert.equal(answers[4].text, answers[2].text);
+  assert.ok(answers[3].logs.includes('nothing new to show: the last playlist again'));
+  assert.deepEqual(answers[4].logs, [], 'told once');
+  assert.equal(segments(answers[5].text), 'seg112.mp4,seg113.mp4,seg114.mp4,seg115.mp4');
+  assert.ok(answers.every((a) => segments(a.text) !== ''));
 });
 
 test('session: no ads → the same segments, nothing dropped, prefetch hints kept, not in a break', () => {

@@ -88,6 +88,23 @@ test('session: a break filled from the backup copy, then the stream itself again
   assert.deepEqual([...seqs].sort((a, b) => a - b), seqs, 'MEDIA-SEQUENCE never goes back');
 });
 
+test('session: the backup a segment ahead at the break\'s end: the last playlist again until the stream catches up', () => {
+  const s = f.createSession();
+  s.playlist(`#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1280x720\n${MAIN}\n`, 'https://usher.ttvnw.net/api/v2/channel/hls/somebody.m3u8?sig=x');
+  const step = (text, b) => {
+    const info = s.info(text, MAIN);
+    return s.playlist(text, MAIN, info.wantsBackup && b ? { text: b, url: BACKUP } : undefined);
+  };
+  step(main(100, 'cccccc'));
+  step(main(102, 'ccccaa'), backup(102, 7));
+  const ending = step(main(105, 'aaccc'), backup(105, 7));
+  assert.equal(segments(ending.text), 'b106.ts,b107.ts,b108.ts,b109.ts,b110.ts,b111.ts');
+  const behind = step(main(106, 'acccc'));
+  assert.equal(behind.text, ending.text, 'm107–m110 were shown by the backup already: nothing new, but never empty');
+  const after = step(main(107, 'accccc'));
+  assert.equal(segments(after.text), 'm112.ts');
+});
+
 test('session: a backup with ads of its own is not used; the card shows', () => {
   const s = f.createSession();
   s.playlist(main(100, 'cccccc'), MAIN);

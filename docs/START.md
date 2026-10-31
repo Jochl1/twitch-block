@@ -129,8 +129,11 @@ seen gets a stream of its own, keyed by its URL path. The worker keeps the last 
 - An ended playlist (`#EXT-X-ENDLIST`, a VOD) is whole: ads removed, never "in a break". Note: removing a VOD's ads
   shortens its timeline, so Twitch's own seek bar and "resume at" can be a little off; fine for stage 1.
 
-Lumen also **holds** a reload while a break brings nothing new (AVPlayer gives up on a live playlist that stops
-growing). Leave that out at first: the IVS player just waits. Add it only if the player errors during long breaks.
+**Never an empty live playlist.** When nothing can be shown (a break longer than Twitch's ~30 s window without a
+backup; or the stream's own content not yet past what the backup showed, right after a break), the splicer answers
+that address's last answer with segments again (as Lumen holds a reload; log: `nothing new to show: the last playlist
+again`). Found in Opera GX (2026-10-31): an empty media playlist makes Twitch show its offline screen, sometimes for
+good. An address with nothing to hold yet (a pre-roll on a fresh start without a clean backup) still gets an empty one.
 
 Unproven until tested in the browser: how the IVS player takes renumbered playlists and discontinuities. If it
 misbehaves, the fallback is the simplest form: keep `MEDIA-SEQUENCE` as Twitch sent it and only delete the ad lines.
